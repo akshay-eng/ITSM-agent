@@ -1,5 +1,6 @@
 """
 Simplified ITSM ServiceNow Agent with Wipro AI
+- FIXED: Ensures tool calls complete before returning final response
 - Uses official langchain-wiproai package
 - LLM-driven decision making (no regex)
 - Fast workflow execution
@@ -9,7 +10,7 @@ Simplified ITSM ServiceNow Agent with Wipro AI
 """
 
 from typing import Dict, List
-from langchain_core.messages import HumanMessage, AIMessage, BaseMessage
+from langchain_core.messages import HumanMessage, AIMessage, BaseMessage, ToolMessage
 from langgraph.graph import MessagesState
 from langgraph.prebuilt import create_react_agent
 import os
@@ -30,8 +31,6 @@ load_dotenv()
 # ============================================================================
 # WIPRO AI LLM INITIALIZATION
 # ============================================================================
-# Initialize LLM using the official langchain-wiproai package
-# The model will automatically read from environment variables if not specified
 llm = ChatWiproAI(
     model_name="gpt-4o",
     temperature=0.0,
@@ -51,12 +50,13 @@ pending_approval: Dict[str, Dict] = {}
 current_attachment = None
 
 # ============================================================================
-# MILVUS RETRIEVAL TOOLS
+# MILVUS RETRIEVAL TOOLS - FETCHES ALL FIELDS
 # ============================================================================
 
 @tool
 def search_similar_incidents(description: str) -> str:
-    """Search for similar historical incidents in Milvus based on description."""
+    """Search for similar historical incidents in Milvus based on description.
+    Returns ALL available fields from the incident record."""
     MILVUS_HOST = os.getenv('MILVUS_HOST', "172.17.204.5")
     MILVUS_PORT = os.getenv('MILVUS_PORT', "19530")
     COLLECTION_NAME = "incident_history"
@@ -72,24 +72,17 @@ def search_similar_incidents(description: str) -> str:
         model = SentenceTransformer(os.getenv('EMBEDDING_MODEL', "all-MiniLM-L6-v2"))
         query_embedding = model.encode([description]).tolist()
 
-        # Get available fields from collection schema
+        # Get ALL available fields from collection schema (except embedding and id)
         schema = collection.schema
-        available_fields = [field.name for field in schema.fields if field.name != "embedding"]
+        output_fields = [field.name for field in schema.fields if field.name not in ["embedding", "id"]]
 
-        # Define desired fields and only include those that exist
-        desired_fields = ["number", "short_description", "description", "priority", "impact",
-                         "urgency", "category", "assignment_group", "state", "resolved_by",
-                         "resolution_notes", "close_notes"]
-        output_fields = [f for f in desired_fields if f in available_fields]
-
-        if not output_fields:
-            output_fields = available_fields[:10]  # Get first 10 fields if no match
+        print(f"[Milvus] Fetching ALL {len(output_fields)} fields for incidents")
 
         results = collection.search(
             query_embedding,
             "embedding",
             {"metric_type": "COSINE", "params": {"nprobe": 10}},
-            limit=1,
+            limit=3,
             output_fields=output_fields
         )
 
@@ -99,28 +92,27 @@ def search_similar_incidents(description: str) -> str:
         matches = []
         for idx, hit in enumerate(results[0], 1):
             entity = hit.entity
-
-            # Get incident number first (if available)
             incident_number = entity.get('number', f'Incident #{idx}')
 
-            # Create detailed header with incident number and similarity score
             match_parts = [
                 f"{'='*70}",
-                f"SIMILAR INCIDENT: {incident_number}",
+                f"SIMILAR INCIDENT #{idx}: {incident_number}",
                 f"Similarity Score: {hit.score:.2%}",
                 f"{'='*70}",
                 ""
             ]
 
-            # Add all available fields with full details
             for field in output_fields:
                 if field == 'number':
-                    continue  # Skip number field since it's already in header
-                value = entity.get(field, 'N/A')
+                    continue
+                
+                value = entity.get(field, 'NA')
                 field_name = field.replace('_', ' ').title()
 
-                # Handle long text fields differently
-                if field in ['description', 'resolution_notes', 'close_notes'] and value and value != 'N/A':
+                long_text_fields = ['description', 'short_description', 'correlation_display', 
+                                   'work_notes', 'comments', 'close_notes', 'resolution_notes']
+                
+                if field in long_text_fields and value and value != 'NA' and len(str(value)) > 50:
                     match_parts.append(f"\n**{field_name}**:")
                     match_parts.append(f"{value}")
                 else:
@@ -138,7 +130,8 @@ def search_similar_incidents(description: str) -> str:
 
 @tool
 def search_similar_change_requests(description: str) -> str:
-    """Search for similar historical change requests in Milvus."""
+    """Search for similar historical change requests in Milvus.
+    Returns ALL available fields from the change request record."""
     MILVUS_HOST = os.getenv('MILVUS_HOST', "172.17.204.5")
     MILVUS_PORT = os.getenv('MILVUS_PORT', "19530")
     COLLECTION_NAME = "change_request_history"
@@ -154,24 +147,16 @@ def search_similar_change_requests(description: str) -> str:
         model = SentenceTransformer(os.getenv('EMBEDDING_MODEL', "all-MiniLM-L6-v2"))
         query_embedding = model.encode([description]).tolist()
 
-        # Get available fields from collection schema
         schema = collection.schema
-        available_fields = [field.name for field in schema.fields if field.name != "embedding"]
+        output_fields = [field.name for field in schema.fields if field.name not in ["embedding", "id"]]
 
-        # Define desired fields and only include those that exist
-        desired_fields = ["number", "short_description", "description", "type", "impact", "urgency",
-                         "priority", "risk", "assignment_group", "justification", "implementation_plan",
-                         "backout_plan", "test_plan", "state"]
-        output_fields = [f for f in desired_fields if f in available_fields]
-
-        if not output_fields:
-            output_fields = available_fields[:10]  # Get first 10 fields if no match
+        print(f"[Milvus] Fetching ALL {len(output_fields)} fields for change requests")
 
         results = collection.search(
             query_embedding,
             "embedding",
             {"metric_type": "COSINE", "params": {"nprobe": 10}},
-            limit=1,
+            limit=3,
             output_fields=output_fields
         )
 
@@ -181,28 +166,28 @@ def search_similar_change_requests(description: str) -> str:
         matches = []
         for idx, hit in enumerate(results[0], 1):
             entity = hit.entity
-
-            # Get change request number first (if available)
             change_number = entity.get('number', f'Change Request #{idx}')
 
-            # Create detailed header with change number and similarity score
             match_parts = [
                 f"{'='*70}",
-                f"SIMILAR CHANGE REQUEST: {change_number}",
+                f"SIMILAR CHANGE REQUEST #{idx}: {change_number}",
                 f"Similarity Score: {hit.score:.2%}",
                 f"{'='*70}",
                 ""
             ]
 
-            # Add all available fields with full details
             for field in output_fields:
                 if field == 'number':
-                    continue  # Skip number field since it's already in header
-                value = entity.get(field, 'N/A')
+                    continue
+                
+                value = entity.get(field, 'NA')
                 field_name = field.replace('_', ' ').title()
 
-                # Handle long text fields differently
-                if field in ['description', 'justification', 'implementation_plan', 'backout_plan', 'test_plan'] and value and value != 'N/A':
+                long_text_fields = ['description', 'short_description', 'justification', 
+                                   'implementation_plan', 'backout_plan', 'test_plan', 
+                                   'risk_impact_analysis', 'change_plan']
+                
+                if field in long_text_fields and value and value != 'NA' and len(str(value)) > 50:
                     match_parts.append(f"\n**{field_name}**:")
                     match_parts.append(f"{value}")
                 else:
@@ -219,6 +204,41 @@ def search_similar_change_requests(description: str) -> str:
 
 
 # ============================================================================
+# HELPER FUNCTION TO EXTRACT FINAL AI MESSAGE
+# ============================================================================
+
+def extract_final_response(messages: List[BaseMessage]) -> str:
+    """
+    Extract the final AI response from the message list.
+    Ensures we skip intermediate tool call messages and get the actual response.
+    """
+    # Start from the end and look for the last AIMessage that's not a tool call
+    for msg in reversed(messages):
+        if isinstance(msg, AIMessage):
+            # Check if this is a tool call message
+            if hasattr(msg, 'tool_calls') and msg.tool_calls:
+                # This is a tool call initiation, skip it
+                continue
+            
+            # Check if content looks like a tool call description
+            content = str(msg.content)
+            if content.startswith("Called tool:") or content.startswith("\nCalled tool:"):
+                # Skip tool call descriptions
+                continue
+            
+            # This is a real response
+            if content and len(content.strip()) > 0:
+                return content
+    
+    # Fallback: return the last AIMessage content
+    for msg in reversed(messages):
+        if isinstance(msg, AIMessage) and msg.content:
+            return str(msg.content)
+    
+    return "I processed your request but didn't generate a response. Please try again."
+
+
+# ============================================================================
 # MAIN AGENT
 # ============================================================================
 
@@ -232,13 +252,16 @@ async def main_agent(state: MessagesState, session_id: str = "default") -> Dict:
 **CRITICAL RULES:**
 1. When a user asks for information (incident details, resolution steps, etc.), you MUST call the appropriate tool immediately
 2. Do NOT just say you will do something - actually do it by calling the tool
-3. Always output tool calls as pure JSON: {"tool": "tool_name", "arguments": {"param": "value"}}
+3. After calling a tool, ALWAYS wait for the result and then provide a summary to the user
+4. Never stop after just calling a tool - always provide the final response
+5. **CRITICAL FOR MILVUS RESULTS**: When you receive search results from search_similar_incidents or search_similar_change_requests tools, you MUST display ALL fields returned in the search results. DO NOT truncate, summarize, or skip any fields. Show the COMPLETE data including full text of Implementation Plans, Backout Plans, Test Plans, Justifications, Descriptions, etc.
 
 **Common Workflows:**
 
 **Getting Incident/Change Details:**
 - User asks: "get details of incident INC123" 
 - You do: Call get_record tool immediately with the incident number
+- Then: Summarize the results for the user
 
 **Getting Resolution Steps:**
 - User asks: "resolution steps for INC123"
@@ -250,7 +273,7 @@ async def main_agent(state: MessagesState, session_id: str = "default") -> Dict:
 **Creating Incidents (FOLLOW THIS FORMAT EXACTLY):**
 When a user wants to create an incident:
 1. Call search_similar_incidents with the description
-2. After receiving results, format your response EXACTLY like this:
+2. After receiving the COMPLETE results from Milvus (which includes ALL fields), format your response EXACTLY like this:
 
 Based on your incident description, I found similar historical incidents and inferred the missing details:
 
@@ -261,25 +284,68 @@ Based on your incident description, I found similar historical incidents and inf
 - **Impact**: [number] (inferred from similar incidents)
 - **Urgency**: [number] (inferred from similar incidents)
 - **Category**: [value] (inferred from similar incidents)
+- **Subcategory**: [value] (inferred from similar incidents)
 - **Assignment Group**: [value] (inferred from similar incidents)
+- **Caller**: [value] (inferred from similar incidents)
+- **Service**: [value] (inferred from similar incidents)
+- **Service Offering**: [value] (inferred from similar incidents)
+- **Configuration Item**: [value] (inferred from similar incidents)
+- **IP Address**: [value] (inferred from similar incidents)
+- **Instance Name**: [value] (inferred from similar incidents)
+- **Database Version**: [value] (inferred from similar incidents)
+- **Company**: [value] (inferred from similar incidents)
 
 **📚 REFERENCE INCIDENTS USED FOR INFERENCE:**
-[paste the COMPLETE similar incidents results here with ALL fields including similarity score, description, resolution notes, etc.]
+
+CRITICAL: You MUST include the COMPLETE Milvus search results here. DO NOT summarize or truncate.
+For EACH similar incident found, display:
+
+**Incident #X: [INC Number]**
+Similarity Score: [score]
+
+Then list EVERY SINGLE FIELD returned from Milvus including but not limited to:
+- Number
+- Opened
+- Short Description
+- Description (FULL TEXT - DO NOT TRUNCATE)
+- Caller
+- Priority
+- State
+- Category
+- Subcategory
+- Assignment Group
+- Assigned To
+- Updated
+- Updated By
+- Correlation Display (FULL TEXT if present)
+- Correlation ID
+- Service
+- Service Offering
+- Configuration Item
+- Impact
+- Urgency
+- IP Address
+- Instance Name
+- Database Version
+- Company
+
+And ANY OTHER fields present in the search results. Show them ALL.
 
 **❓ CONFIRMATION REQUIRED:**
 Please review the proposed details and respond with:
-- "Yes" or "Create it" to proceed with these details
-- "Change [field] to [value]" to modify (e.g., "Change priority to 2")
-- "Cancel" to cancel the incident creation
+- "Yes" or "Create it" to proceed
+- "Change [field] to [value]" to modify
+- "Cancel" to cancel
 
 **⏳ I'm waiting for your confirmation before creating the incident.**
 
-3. When user confirms with "yes" or "create it", call the create_incident tool with all the details
+3. When user confirms, call create_incident tool and WAIT for the result
+4. After the tool returns, summarize the created incident details to the user
 
 **Creating Change Requests (FOLLOW THIS FORMAT EXACTLY):**
 When a user wants to create a change request:
 1. Call search_similar_change_requests with the description
-2. After receiving results, format your response EXACTLY like this:
+2. After receiving the COMPLETE results from Milvus (which includes ALL fields), format your response EXACTLY like this:
 
 Based on your change request description, I found similar historical change requests and inferred the missing details:
 
@@ -291,28 +357,52 @@ Based on your change request description, I found similar historical change requ
 - **Impact**: [number] (inferred from similar change requests)
 - **Urgency**: [number] (inferred from similar change requests)
 - **Risk**: [value] (inferred from similar change requests)
+- **Category**: [value] (inferred from similar change requests)
 - **Assignment Group**: [value] (inferred from similar change requests)
-- **Justification**: [value] (inferred from similar change requests)
-- **Implementation Plan**: [value] (inferred from similar change requests)
-- **Backout Plan**: [value] (inferred from similar change requests)
-- **Test Plan**: [value] (inferred from similar change requests)
+- **Service**: [value] (inferred from similar change requests)
+- **Service Offering**: [value] (inferred from similar change requests)
+- **Configuration Item**: [value] (inferred from similar change requests)
+- **Model**: [value] (inferred from similar change requests)
+- **Requested By**: [value] (inferred from similar change requests)
+- **Justification**: [FULL TEXT from similar change requests]
+- **Implementation Plan**: [FULL TEXT from similar change requests]
+- **Backout Plan**: [FULL TEXT from similar change requests]
+- **Test Plan**: [FULL TEXT from similar change requests]
+- **Risk Impact Analysis**: [FULL TEXT from similar change requests]
 
 **📚 REFERENCE CHANGE REQUESTS USED FOR INFERENCE:**
-[paste the COMPLETE similar change request results here with ALL fields including:
-- Change Request Number
-- Similarity Score
+
+CRITICAL: You MUST include the COMPLETE Milvus search results here. DO NOT summarize or truncate. 
+For EACH similar change request found, display:
+
+**Change Request #X: [CHG Number]**
+Similarity Score: [score]
+
+Then list EVERY SINGLE FIELD returned from Milvus including but not limited to:
+- Number
 - Short Description
-- Full Description
+- Description (FULL TEXT)
 - Type
-- Impact, Urgency, Priority
-- Risk
-- Assignment Group
-- Justification (full text)
-- Implementation Plan (full text)
-- Backout Plan (full text)
-- Test Plan (full text)
 - State
-And ALL other available fields from the search results]
+- Impact
+- Urgency
+- Priority
+- Risk
+- Category
+- Assignment Group
+- Assigned To
+- Requested By
+- Service
+- Service Offering
+- Configuration Item
+- Model
+- Justification (FULL TEXT - DO NOT TRUNCATE)
+- Implementation Plan (FULL TEXT - DO NOT TRUNCATE)
+- Backout Plan (FULL TEXT - DO NOT TRUNCATE)
+- Test Plan (FULL TEXT - DO NOT TRUNCATE)
+- Risk Impact Analysis (FULL TEXT - DO NOT TRUNCATE)
+
+And ANY OTHER fields present in the search results.
 
 **❓ CONFIRMATION REQUIRED:**
 Please review the proposed details and respond with:
@@ -322,9 +412,14 @@ Please review the proposed details and respond with:
 
 **⏳ I'm waiting for your confirmation before creating the change request.**
 
-3. When user confirms with "yes" or "create it", call the create_change_request tool with all the details
+3. When user confirms, call create_change_request and WAIT for the result
+4. After the tool returns, summarize the created change request details to the user
 
-Remember: ACT, don't just talk about acting. Call tools immediately when needed."""
+**IMPORTANT**: 
+- After calling ANY tool, you MUST wait for the result and provide a final summary
+- Never leave the user with just "Called tool: xyz"
+- When displaying Milvus search results, show ALL fields without truncation
+- DO NOT summarize the Implementation Plan, Backout Plan, Test Plan, or Justification - show them in FULL"""
 
     try:
         async with MultiServerMCPClient({
@@ -338,8 +433,6 @@ Remember: ACT, don't just talk about acting. Call tools immediately when needed.
             }
         }) as client:
             snow_tools = client.get_tools()
-
-            # Add Milvus search tools
             all_tools = snow_tools + [search_similar_incidents, search_similar_change_requests]
 
             print(f"\n[Agent] Loaded {len(all_tools)} tools")
@@ -349,34 +442,40 @@ Remember: ACT, don't just talk about acting. Call tools immediately when needed.
             if session_id not in conversation_memory:
                 conversation_memory[session_id] = []
             
-            # Add current messages to history
             conversation_memory[session_id].extend(state['messages'])
-            
-            # Keep only last 20 messages to manage context
             conversation_memory[session_id] = conversation_memory[session_id][-20:]
             
-            # Create state with full history
             full_state = {
                 "messages": conversation_memory[session_id]
             }
 
             # Create agent with proper tool binding
-            agent = create_react_agent(llm, all_tools, state_modifier=system_prompt)
+            agent = create_react_agent(
+                llm, 
+                all_tools, 
+                state_modifier=system_prompt,
+            )
 
-            # Run agent
+            # Run agent with recursion limit to ensure completion
             print(f"[Agent] Starting agent execution...")
-            result = await agent.ainvoke(full_state)
+            result = await agent.ainvoke(
+                full_state,
+                config={
+                    "recursion_limit": 50,  # Allow multiple tool call iterations
+                }
+            )
             
             # Update conversation memory with results
             conversation_memory[session_id] = result['messages']
             
             print(f"[Agent] Agent completed. Message count: {len(result['messages'])}")
             
-            # Debug: print last few messages
-            for i, msg in enumerate(result['messages'][-3:]):
+            # Debug: print last few messages with types
+            for i, msg in enumerate(result['messages'][-5:]):
                 msg_type = type(msg).__name__
                 content_preview = str(msg.content)[:100] if hasattr(msg, 'content') else 'no content'
-                print(f"[Agent] Message {i} ({msg_type}): {content_preview}")
+                has_tool_calls = hasattr(msg, 'tool_calls') and msg.tool_calls
+                print(f"[Agent] Message {i} ({msg_type}, tool_calls={has_tool_calls}): {content_preview}")
 
             return result
 
@@ -400,7 +499,7 @@ Remember: ACT, don't just talk about acting. Call tools immediately when needed.
 def health():
     return jsonify({
         'status': 'healthy',
-        'service': 'ITSM ServiceNow Agent with Wipro AI',
+        'service': 'ITSM ServiceNow Agent with Wipro AI - FIXED VERSION',
         'timestamp': datetime.now().isoformat(),
         'active_sessions': len(conversation_memory)
     })
@@ -452,17 +551,10 @@ def chat():
         try:
             result = loop.run_until_complete(main_agent(state, session_id))
             
-            # Get the final AI message
-            final_message = None
-            for msg in reversed(result["messages"]):
-                if isinstance(msg, AIMessage):
-                    final_message = msg.content
-                    break
+            # Extract the final AI message using improved logic
+            final_message = extract_final_response(result["messages"])
             
-            if not final_message:
-                final_message = "I processed your request but didn't generate a response. Please try again."
-            
-            print(f"\n[Chat] Final response: {final_message[:200]}...")
+            print(f"\n[Chat] Final response extracted: {final_message[:200]}...")
             
         except Exception as e:
             print(f"[Chat] Workflow error: {e}")
@@ -497,7 +589,6 @@ def reset():
     data = request.get_json() if request.is_json else {}
     session_id = data.get('session_id', 'default')
     
-    # Clear specific session or all sessions
     if session_id == 'all':
         conversation_memory = {}
         pending_approval = {}
@@ -537,7 +628,7 @@ def get_sessions():
 
 if __name__ == '__main__':
     print("=" * 60)
-    print("ITSM ServiceNow Agent with Wipro AI")
+    print("ITSM ServiceNow Agent with Wipro AI - FIXED VERSION")
     print("=" * 60)
     print("Features:")
     print("  ✓ Official langchain-wiproai package integration")
@@ -548,6 +639,8 @@ if __name__ == '__main__':
     print("  ✓ Formatted incident creation workflow")
     print("  ✓ Milvus vector search integration")
     print("  ✓ ServiceNow MCP integration")
+    print("  ✓ FETCHES ALL FIELDS from Milvus")
+    print("  ✓ FIXED: Ensures tool calls complete before returning")
     print("=" * 60)
     print("API: http://localhost:5019")
     print("Endpoints:")
@@ -558,4 +651,3 @@ if __name__ == '__main__':
     print("=" * 60)
 
     app.run(debug=True, host='0.0.0.0', port=5019)
- 
