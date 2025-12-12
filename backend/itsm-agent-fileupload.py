@@ -308,9 +308,9 @@ def add_change_request_attachment(change_id: str, file_name: str, file_content_s
 @tool
 def check_change_conflicts_after_creation(change_number: str, ci_sys_id: str, start_date: str, end_date: str) -> str:
     """Checks for conflicting change requests AFTER a change has been created."""
-    SNOW_INSTANCE_URL = os.getenv("SNOW_INSTANCE_URL", "https://dev206825.service-now.com")
-    SNOW_USER = os.getenv("SNOW_USER", "Admin")
-    SNOW_PASS = os.getenv("SNOW_PASS", "T0i9A%Mqu-sN")
+    SNOW_INSTANCE_URL = os.getenv("SNOW_INSTANCE_URL", "")
+    SNOW_USER = os.getenv("SNOW_USER", "")
+    SNOW_PASS = os.getenv("SNOW_PASS", "")
 
     if not SNOW_INSTANCE_URL or not SNOW_USER or not SNOW_PASS:
         return "Error: ServiceNow credentials not set"
